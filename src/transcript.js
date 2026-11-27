@@ -39,6 +39,17 @@ function toLocalDateKey(iso) {
   return `${y}-${m}-${day}`;
 }
 
+function toLocalHourKey(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hr = String(d.getHours()).padStart(2, '0');
+  return `${y}-${m}-${day} ${hr}:00`;
+}
+
 function extractUserText(content) {
   if (!content) return '';
   let raw = '';
@@ -293,6 +304,7 @@ function scanAllConversations() {
       summary: emptySummary(),
       knownModels: [],
       dailyStats: [],
+      hourlyStats: [],
       conversations: [],
     };
   }
@@ -308,6 +320,7 @@ function scanAllConversations() {
       summary: emptySummary(),
       knownModels: [],
       dailyStats: [],
+      hourlyStats: [],
       conversations: [],
     };
   }
@@ -338,8 +351,10 @@ function scanAllConversations() {
 
   const now = new Date();
   const todayKey = toLocalDateKey(now.toISOString());
+  const currentHour = now.getHours();
   const knownModelMap = new Map();
   const dailyMap = new Map();
+  const hourlyMap = new Map();
 
   for (const c of conversations) {
     summary.totalModelCalls += c.modelCalls;
@@ -362,6 +377,9 @@ function scanAllConversations() {
 
     for (const s of c.steps) {
       const dateKey = toLocalDateKey(s.createdAt) || toLocalDateKey(c.updatedAt) || todayKey;
+      const hourKey = toLocalHourKey(s.createdAt) || toLocalHourKey(c.updatedAt) || `${todayKey} 00:00`;
+      const stepTotalTok = s.inputTokens + s.cacheReadTokens + s.outputTokens;
+
       let bucket = dailyMap.get(dateKey);
       if (!bucket) {
         bucket = {
@@ -371,6 +389,7 @@ function scanAllConversations() {
           inputTokens: 0,
           cacheReadTokens: 0,
           outputTokens: 0,
+          totalTokens: 0,
           costUsd: 0,
           cacheSavedUsd: 0,
           byModel: {},
@@ -383,8 +402,34 @@ function scanAllConversations() {
       bucket.inputTokens += s.inputTokens;
       bucket.cacheReadTokens += s.cacheReadTokens;
       bucket.outputTokens += s.outputTokens;
+      bucket.totalTokens += stepTotalTok;
       bucket.costUsd += s.costUsd || 0;
       bucket.cacheSavedUsd += s.cacheSavedUsd || 0;
+
+      let hBucket = hourlyMap.get(hourKey);
+      if (!hBucket) {
+        hBucket = {
+          hour: hourKey,
+          date: dateKey,
+          calls: 0,
+          convIds: new Set(),
+          inputTokens: 0,
+          cacheReadTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          costUsd: 0,
+          cacheSavedUsd: 0,
+        };
+        hourlyMap.set(hourKey, hBucket);
+      }
+      hBucket.calls += 1;
+      hBucket.convIds.add(c.id);
+      hBucket.inputTokens += s.inputTokens;
+      hBucket.cacheReadTokens += s.cacheReadTokens;
+      hBucket.outputTokens += s.outputTokens;
+      hBucket.totalTokens += stepTotalTok;
+      hBucket.costUsd += s.costUsd || 0;
+      hBucket.cacheSavedUsd += s.cacheSavedUsd || 0;
 
       const mKey = s.model || 'unknown';
       if (!bucket.byModel[mKey]) {
@@ -395,6 +440,7 @@ function scanAllConversations() {
           inputTokens: 0,
           cacheReadTokens: 0,
           outputTokens: 0,
+          totalTokens: 0,
           costUsd: 0,
           cacheSavedUsd: 0,
         };
@@ -404,6 +450,7 @@ function scanAllConversations() {
       bm.inputTokens += s.inputTokens;
       bm.cacheReadTokens += s.cacheReadTokens;
       bm.outputTokens += s.outputTokens;
+      bm.totalTokens += stepTotalTok;
       bm.costUsd += s.costUsd || 0;
       bm.cacheSavedUsd += s.cacheSavedUsd || 0;
 
@@ -430,14 +477,23 @@ function scanAllConversations() {
       models: Object.values(byModel).sort((a, b) => b.costUsd - a.costUsd),
     }));
 
+  const hourlyStats = Array.from(hourlyMap.values())
+    .sort((a, b) => a.hour.localeCompare(b.hour))
+    .map(({ convIds, ...rest }) => ({
+      ...rest,
+      conversationCount: convIds.size,
+    }));
+
   return {
     brainDir: BRAIN_DIR,
     exists: true,
     generatedAt: new Date().toISOString(),
     todayKey,
+    currentHour,
     summary,
     knownModels: Array.from(knownModelMap.values()),
     dailyStats,
+    hourlyStats,
     conversations: conversations.map(({ steps, ...rest }) => rest),
   };
 }

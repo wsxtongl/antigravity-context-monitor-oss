@@ -70,19 +70,24 @@ async function build() {
   // Optional: --install copies runtime bundle into local Antigravity plugins dir
   if (process.argv.includes('--install')) {
     const targetDir = path.join(os.homedir(), '.gemini', 'config', 'plugins', 'context-monitor');
-    const filesToCopy = [
+    const alwaysCopy = [
+      path.join('dist', 'app.html'),
+      path.join('dist', 'server.cjs'),
+    ];
+    const initOnlyCopy = [
       'plugin.json',
       'mcp_config.json',
       'README.md',
       path.join('assets', 'logo.svg'),
-      path.join('dist', 'app.html'),
-      path.join('dist', 'server.cjs'),
     ];
-    for (const rel of filesToCopy) {
+    for (const rel of alwaysCopy) {
       const src = path.join(REPO_ROOT, rel);
-      if (fs.existsSync(src)) {
-        copyFileSafe(src, path.join(targetDir, rel));
-      }
+      if (fs.existsSync(src)) copyFileSafe(src, path.join(targetDir, rel));
+    }
+    for (const rel of initOnlyCopy) {
+      const src = path.join(REPO_ROOT, rel);
+      const dst = path.join(targetDir, rel);
+      if (fs.existsSync(src) && !fs.existsSync(dst)) copyFileSafe(src, dst);
     }
     console.log(`[install] Synced plugin to: ${targetDir}`);
   }

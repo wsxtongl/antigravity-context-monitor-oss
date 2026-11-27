@@ -1,7 +1,7 @@
 {
   "name": "context-monitor",
   "displayName": "上下文与 Token 监控",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "纯本地只读查看 Antigravity 各会话的上下文窗口占用、缓存命中率、参考费用估算、多日消耗趋势与逐轮 Token 明细，支持右侧边栏与左侧全屏面板。",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

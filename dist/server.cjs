@@ -42362,6 +42362,16 @@ var require_transcript = __commonJS({
       const day = String(d.getDate()).padStart(2, "0");
       return `${y}-${m}-${day}`;
     }
+    function toLocalHourKey(iso) {
+      if (!iso) return null;
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return null;
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      const hr = String(d.getHours()).padStart(2, "0");
+      return `${y}-${m}-${day} ${hr}:00`;
+    }
     function extractUserText(content) {
       if (!content) return "";
       let raw = "";
@@ -42585,6 +42595,7 @@ var require_transcript = __commonJS({
           summary: emptySummary(),
           knownModels: [],
           dailyStats: [],
+          hourlyStats: [],
           conversations: []
         };
       }
@@ -42599,6 +42610,7 @@ var require_transcript = __commonJS({
           summary: emptySummary(),
           knownModels: [],
           dailyStats: [],
+          hourlyStats: [],
           conversations: []
         };
       }
@@ -42623,8 +42635,10 @@ var require_transcript = __commonJS({
       summary.activeCount = conversations.filter((c) => c.isActive).length;
       const now = /* @__PURE__ */ new Date();
       const todayKey = toLocalDateKey(now.toISOString());
+      const currentHour = now.getHours();
       const knownModelMap = /* @__PURE__ */ new Map();
       const dailyMap = /* @__PURE__ */ new Map();
+      const hourlyMap = /* @__PURE__ */ new Map();
       for (const c of conversations) {
         summary.totalModelCalls += c.modelCalls;
         summary.totalInputTokens += c.totals.inputTokens;
@@ -42644,6 +42658,8 @@ var require_transcript = __commonJS({
         }
         for (const s of c.steps) {
           const dateKey = toLocalDateKey(s.createdAt) || toLocalDateKey(c.updatedAt) || todayKey;
+          const hourKey = toLocalHourKey(s.createdAt) || toLocalHourKey(c.updatedAt) || `${todayKey} 00:00`;
+          const stepTotalTok = s.inputTokens + s.cacheReadTokens + s.outputTokens;
           let bucket = dailyMap.get(dateKey);
           if (!bucket) {
             bucket = {
@@ -42653,6 +42669,7 @@ var require_transcript = __commonJS({
               inputTokens: 0,
               cacheReadTokens: 0,
               outputTokens: 0,
+              totalTokens: 0,
               costUsd: 0,
               cacheSavedUsd: 0,
               byModel: {}
@@ -42664,8 +42681,33 @@ var require_transcript = __commonJS({
           bucket.inputTokens += s.inputTokens;
           bucket.cacheReadTokens += s.cacheReadTokens;
           bucket.outputTokens += s.outputTokens;
+          bucket.totalTokens += stepTotalTok;
           bucket.costUsd += s.costUsd || 0;
           bucket.cacheSavedUsd += s.cacheSavedUsd || 0;
+          let hBucket = hourlyMap.get(hourKey);
+          if (!hBucket) {
+            hBucket = {
+              hour: hourKey,
+              date: dateKey,
+              calls: 0,
+              convIds: /* @__PURE__ */ new Set(),
+              inputTokens: 0,
+              cacheReadTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+              costUsd: 0,
+              cacheSavedUsd: 0
+            };
+            hourlyMap.set(hourKey, hBucket);
+          }
+          hBucket.calls += 1;
+          hBucket.convIds.add(c.id);
+          hBucket.inputTokens += s.inputTokens;
+          hBucket.cacheReadTokens += s.cacheReadTokens;
+          hBucket.outputTokens += s.outputTokens;
+          hBucket.totalTokens += stepTotalTok;
+          hBucket.costUsd += s.costUsd || 0;
+          hBucket.cacheSavedUsd += s.cacheSavedUsd || 0;
           const mKey = s.model || "unknown";
           if (!bucket.byModel[mKey]) {
             bucket.byModel[mKey] = {
@@ -42675,6 +42717,7 @@ var require_transcript = __commonJS({
               inputTokens: 0,
               cacheReadTokens: 0,
               outputTokens: 0,
+              totalTokens: 0,
               costUsd: 0,
               cacheSavedUsd: 0
             };
@@ -42684,6 +42727,7 @@ var require_transcript = __commonJS({
           bm.inputTokens += s.inputTokens;
           bm.cacheReadTokens += s.cacheReadTokens;
           bm.outputTokens += s.outputTokens;
+          bm.totalTokens += stepTotalTok;
           bm.costUsd += s.costUsd || 0;
           bm.cacheSavedUsd += s.cacheSavedUsd || 0;
           if (dateKey === todayKey) {
@@ -42704,14 +42748,20 @@ var require_transcript = __commonJS({
         conversationIds: Array.from(convIds),
         models: Object.values(byModel).sort((a, b) => b.costUsd - a.costUsd)
       }));
+      const hourlyStats = Array.from(hourlyMap.values()).sort((a, b) => a.hour.localeCompare(b.hour)).map(({ convIds, ...rest }) => ({
+        ...rest,
+        conversationCount: convIds.size
+      }));
       return {
         brainDir: BRAIN_DIR,
         exists: true,
         generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
         todayKey,
+        currentHour,
         summary,
         knownModels: Array.from(knownModelMap.values()),
         dailyStats,
+        hourlyStats,
         conversations: conversations.map(({ steps, ...rest }) => rest)
       };
     }
@@ -42773,7 +42823,7 @@ function fmtMoney(usd, cfg) {
 var server = new Server(
   {
     name: "context-monitor",
-    version: "1.2.0"
+    version: "1.3.0"
   },
   {
     capabilities: {
@@ -42913,7 +42963,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (detail) {
       const pct = (detail.currentContext / detail.defaultContextLimit * 100).toFixed(1);
       lines.push(
-        `\u5F53\u524D\u805A\u7126\u4F1A\u8BDD\u300C${detail.title}\u300D(${detail.id.slice(0, 8)}): \u4E0A\u4E0B\u6587 ${detail.currentContext.toLocaleString("en-US")} tokens (${pct}% / ${fmtCompact(detail.defaultContextLimit)})\uFF0C\u7F13\u5B58\u547D\u4E2D\u7387 ${(detail.currentCacheHitRate * 100).toFixed(1)}%\uFF0C\u672C\u4F1A\u8BDD\u53C2\u8003\u8D39\u7528 ${fmtMoney(detail.cost.totalUsd, pricingConfig)}\uFF08\u7F13\u5B58\u7EA6\u7701 ${fmtMoney(detail.cost.cacheSavedUsd, pricingConfig)}\uFF09\u3002`
+        `\u5F53\u524D\u805A\u7126\u4F1A\u8BDD\u300C${detail.title}\u300D(${detail.id.slice(0, 8)}): \u4E0A\u4E0B\u6587 ${detail.currentContext.toLocaleString("en-US")} tokens (${pct}% / ${fmtCompact(detail.defaultContextLimit)})\uFF0C\u7F13\u5B58\u547D\u4E2D\u7387 ${(detail.currentCacheHitRate * 100).toFixed(1)}%\uFF0C\u672C\u4F1A\u8BDD\u53C2\u8003\u6210\u672C ${fmtMoney(detail.cost.totalUsd, pricingConfig)}\u3002`
       );
     }
     return {

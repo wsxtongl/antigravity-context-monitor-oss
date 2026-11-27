@@ -4,7 +4,7 @@ import {
   applyHostStyleVariables,
 } from '@modelcontextprotocol/ext-apps';
 
-const app = new App({ name: 'Antigravity Context Monitor', version: '1.2.0' }, {});
+const app = new App({ name: 'Antigravity Context Monitor', version: '1.3.0' }, {});
 
 const state = {
   overview: null,
@@ -15,8 +15,14 @@ const state = {
   rangeMode: 'today', // today | 3d | 7d | 30d | all | custom
   customStart: '',
   customEnd: '',
-  periodOpen: false,
-  periodMetric: 'cost', // cost | tokens | calls
+  periodOpen: true,
+  periodTableOpen: false,
+  periodMetric: 'tokens', // tokens | calls | cost
+  granularity: 'auto', // auto | hour | day
+  ctxChartOpen: null, // null = auto (collapsed in narrow pane, open in wide view)
+  ctxWindow: '30', // '30' | '100' | 'all'
+  stepPage: 1,
+  stepPageSize: 10, // 10 | 20 | 50 | 0 (all)
   refreshIntervalMs: 10000,
   limitMode: 'auto',
   search: '',
@@ -37,6 +43,17 @@ function fmtCompact(n) {
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
   if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
   return String(v);
+}
+
+function fmtCnTokens(n) {
+  const v = Number(n || 0);
+  if (v >= 100_000_000) return `${(v / 100_000_000).toFixed(2)}亿`;
+  if (v >= 10_000) {
+    const w = v / 10_000;
+    return w >= 100 ? `${Math.round(w)}万` : `${w.toFixed(1).replace(/\.0$/, '')}万`;
+  }
+  if (v >= 1_000) return `${(v / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
+  return String(Math.round(v));
 }
 
 function fmtPct(ratio) {
@@ -224,7 +241,7 @@ function shiftDateKey(baseKey, offsetDays) {
 function getRangeBounds() {
   const todayKey = state.overview?.todayKey || localDateKey(new Date());
   if (state.rangeMode === 'today') {
-    return { start: todayKey, end: todayKey, label: '今日', fillDays: 1 };
+    return { start: todayKey, end: todayKey, label: '当天', fillDays: 1 };
   }
   if (state.rangeMode === '3d') {
     return { start: shiftDateKey(todayKey, -2), end: todayKey, label: '近 3 天', fillDays: 3 };
@@ -239,9 +256,64 @@ function getRangeBounds() {
     let s = state.customStart || todayKey;
     let e = state.customEnd || todayKey;
     if (s > e) [s, e] = [e, s];
-    return { start: s, end: e, label: s === e ? s : `${s.slice(5)} ~ ${e.slice(5)}`, fillDays: 0 };
+    const [sy, sm, sd] = s.split('-').map(Number);
+    const [ey, em, ed] = e.split('-').map(Number);
+    const spanDays = Math.round((new Date(ey, em - 1, ed) - new Date(sy, sm - 1, sd)) / 86400000) + 1;
+    return { start: s, end: e, label: s === e ? s : `${s.slice(5)} ~ ${e.slice(5)}`, fillDays: spanDays };
   }
   return { start: null, end: null, label: '全部历史', fillDays: 0 };
+}
+
+function resolveEffectiveGranularity(bounds) {
+  const canHourly = bounds.fillDays >= 1 && bounds.fillDays <= 3 && Boolean(bounds.start && bounds.end);
+  if (!canHourly) return { mode: 'day', canHourly: false };
+  if (state.granularity === 'hour') return { mode: 'hour', canHourly: true };
+  if (state.granularity === 'day') return { mode: 'day', canHourly: true };
+  return { mode: bounds.fillDays === 1 ? 'hour' : 'day', canHourly: true };
+}
+
+function buildHourlySeries(bounds) {
+  const hourlyStats = state.overview?.hourlyStats || [];
+  const byHour = new Map();
+  for (const h of hourlyStats) {
+    if (bounds.start && h.date < bounds.start) continue;
+    if (bounds.end && h.date > bounds.end) continue;
+    byHour.set(h.hour, h);
+  }
+
+  const todayKey = state.overview?.todayKey || localDateKey(new Date());
+  const nowHour = typeof state.overview?.currentHour === 'number'
+    ? state.overview.currentHour
+    : new Date().getHours();
+
+  const series = [];
+  for (let dIdx = 0; dIdx < bounds.fillDays; dIdx++) {
+    const dk = shiftDateKey(bounds.start, dIdx);
+    const maxHr = dk === todayKey ? Math.max(nowHour, 0) : 23;
+    for (let hr = 0; hr <= maxHr; hr++) {
+      const hh = String(hr).padStart(2, '0');
+      const key = `${dk} ${hh}:00`;
+      const existing = byHour.get(key);
+      const shortLabel = `${dk.slice(5).replace('-', '/')} ${hh}:00`;
+      series.push(existing
+        ? { ...existing, key, label: shortLabel }
+        : {
+            key,
+            hour: key,
+            date: dk,
+            label: shortLabel,
+            calls: 0,
+            conversationCount: 0,
+            inputTokens: 0,
+            cacheReadTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            costUsd: 0,
+            cacheSavedUsd: 0,
+          });
+    }
+  }
+  return series;
 }
 
 function computePeriodStats() {
@@ -263,6 +335,7 @@ function computePeriodStats() {
     inputTokens: 0,
     cacheReadTokens: 0,
     outputTokens: 0,
+    totalTokens: 0,
     costUsd: 0,
     cacheSavedUsd: 0,
     daysWithData: matched.length,
@@ -270,11 +343,16 @@ function computePeriodStats() {
 
   const byDate = new Map();
   for (const d of matched) {
-    byDate.set(d.date, d);
+    const totalTok = typeof d.totalTokens === 'number'
+      ? d.totalTokens
+      : (d.inputTokens || 0) + (d.cacheReadTokens || 0) + (d.outputTokens || 0);
+    const normalized = { ...d, totalTokens: totalTok, key: d.date, label: d.date.slice(5).replace('-', '/') };
+    byDate.set(d.date, normalized);
     agg.calls += d.calls || 0;
     agg.inputTokens += d.inputTokens || 0;
     agg.cacheReadTokens += d.cacheReadTokens || 0;
     agg.outputTokens += d.outputTokens || 0;
+    agg.totalTokens += totalTok;
     agg.costUsd += d.costUsd || 0;
     agg.cacheSavedUsd += d.cacheSavedUsd || 0;
     for (const cid of (d.conversationIds || [])) convSet.add(cid);
@@ -286,35 +364,42 @@ function computePeriodStats() {
         inputTokens: 0,
         cacheReadTokens: 0,
         outputTokens: 0,
+        totalTokens: 0,
         costUsd: 0,
       };
       prev.calls += m.calls || 0;
       prev.inputTokens += m.inputTokens || 0;
       prev.cacheReadTokens += m.cacheReadTokens || 0;
       prev.outputTokens += m.outputTokens || 0;
+      prev.totalTokens += (m.inputTokens || 0) + (m.cacheReadTokens || 0) + (m.outputTokens || 0);
       prev.costUsd += m.costUsd || 0;
       modelMap.set(m.model, prev);
     }
   }
 
-  // Build continuous series for fixed-day presets so empty days render honestly
+  const gran = resolveEffectiveGranularity(bounds);
   let series = [];
-  if (bounds.fillDays > 1 && bounds.start) {
+  if (gran.mode === 'hour') {
+    series = buildHourlySeries(bounds);
+  } else if (bounds.fillDays > 1 && bounds.fillDays <= 60 && bounds.start) {
     for (let i = 0; i < bounds.fillDays; i++) {
       const dk = shiftDateKey(bounds.start, i);
       series.push(byDate.get(dk) || {
+        key: dk,
         date: dk,
+        label: dk.slice(5).replace('-', '/'),
         calls: 0,
         conversationCount: 0,
         inputTokens: 0,
         cacheReadTokens: 0,
         outputTokens: 0,
+        totalTokens: 0,
         costUsd: 0,
         cacheSavedUsd: 0,
       });
     }
   } else {
-    series = matched;
+    series = matched.map((d) => byDate.get(d.date));
   }
 
   const promptTotal = agg.inputTokens + agg.cacheReadTokens;
@@ -322,7 +407,9 @@ function computePeriodStats() {
   agg.conversationCount = convSet.size;
   agg.models = Array.from(modelMap.values()).sort((a, b) => b.costUsd - a.costUsd);
   agg.series = series;
-  agg.matched = matched;
+  agg.matched = matched.map((d) => byDate.get(d.date));
+  agg.granularity = gran.mode;
+  agg.canHourly = gran.canHourly;
   return agg;
 }
 
@@ -342,91 +429,167 @@ function renderSummary() {
   const p = computePeriodStats();
   $('summaryStrip').innerHTML = `
     <div class="stat-mini">
-      <div class="label">${escapeHtml(p.label)}调用</div>
-      <div class="value">${fmtNum(p.calls)} 次</div>
-      <div class="sub">新增 ${fmtCompact(p.inputTokens)} · 输出 ${fmtCompact(p.outputTokens)}</div>
+      <div class="label">${escapeHtml(p.label)}总 Token</div>
+      <div class="value">${fmtCnTokens(p.totalTokens)}</div>
+      <div class="sub">入 ${fmtCompact(p.inputTokens)} · 缓 ${fmtCompact(p.cacheReadTokens)} · 出 ${fmtCompact(p.outputTokens)}</div>
     </div>
     <div class="stat-mini">
-      <div class="label">${escapeHtml(p.label)}参考费用</div>
+      <div class="label">${escapeHtml(p.label)}请求次数</div>
+      <div class="value">${fmtNum(p.calls)} 次</div>
+      <div class="sub">活跃会话 ${p.conversationCount} 个 / 共 ${s.conversationCount}</div>
+    </div>
+    <div class="stat-mini">
+      <div class="label">${escapeHtml(p.label)}参考成本</div>
       <div class="value cost-val">${fmtCost(p.costUsd)}</div>
-      <div class="sub">缓存约省 <strong class="live-tag">${fmtCost(p.cacheSavedUsd)}</strong></div>
+      <div class="sub">全部累计成本 <span class="cost-inline">${fmtCost(s.totalCostUsd)}</span></div>
     </div>
     <div class="stat-mini">
       <div class="label">${escapeHtml(p.label)}缓存命中率</div>
       <div class="value">${fmtPct(p.cacheHitRate)}</div>
-      <div class="sub">缓存读取 ${fmtCompact(p.cacheReadTokens)}</div>
-    </div>
-    <div class="stat-mini">
-      <div class="label">${escapeHtml(p.label)}活跃会话 / 全部累计</div>
-      <div class="value">${p.conversationCount} 个 <span class="muted small">/ 共 ${s.conversationCount}</span></div>
-      <div class="sub">全部累计参考费用 <span class="cost-inline">${fmtCost(s.totalCostUsd)}</span></div>
+      <div class="sub">缓存读取 ${fmtCnTokens(p.cacheReadTokens)}</div>
     </div>
   `;
 }
 
-function renderPeriodBarChart(series) {
+function computeNiceMax(rawMax, isCost) {
+  if (rawMax <= 0) return isCost ? 0.1 : 10;
+  const exp = Math.pow(10, Math.floor(Math.log10(rawMax)));
+  const norm = rawMax / exp;
+  let nice = 10;
+  if (norm <= 1.2) nice = 1.2;
+  else if (norm <= 1.5) nice = 1.5;
+  else if (norm <= 2) nice = 2;
+  else if (norm <= 3) nice = 3;
+  else if (norm <= 5) nice = 5;
+  else if (norm <= 6) nice = 6;
+  else if (norm <= 8) nice = 8;
+  return nice * exp;
+}
+
+function getChartWidth(fallback = 640) {
+  const sec = $('periodSection');
+  const detail = $('detailArea');
+  const w = (sec && sec.clientWidth) || (detail && detail.clientWidth) || window.innerWidth || fallback;
+  return Math.max(300, Math.round(w - 28));
+}
+
+function renderPeriodBarChart(series, isSingleDayHourly) {
   if (!series || series.length === 0) {
     return '<div class="empty">所选时间范围内暂无消耗记录</div>';
   }
-  const W = 720;
-  const H = 165;
-  const padL = 54;
+  const W = getChartWidth(720);
+  const H = 195;
+  const padL = W < 480 ? 46 : 56;
   const padR = 14;
-  const padT = 16;
-  const padB = 26;
-  const plotW = W - padL - padR;
+  const padT = 18;
+  const padB = 30;
+  const plotW = Math.max(120, W - padL - padR);
   const plotH = H - padT - padB;
 
   const valOf = (d) => {
-    if (state.periodMetric === 'tokens') return (d.inputTokens || 0) + (d.outputTokens || 0);
+    if (state.periodMetric === 'tokens') return d.totalTokens || 0;
     if (state.periodMetric === 'calls') return d.calls || 0;
     return d.costUsd || 0;
   };
   const fmtTick = (v) => {
-    if (state.periodMetric === 'tokens') return fmtCompact(Math.round(v));
+    if (v === 0) return '0';
+    if (state.periodMetric === 'tokens') return fmtCnTokens(v);
     if (state.periodMetric === 'calls') return String(Math.round(v));
     return fmtCost(v);
   };
 
-  const maxVal = Math.max(
-    state.periodMetric === 'cost' ? 0.01 : 1,
-    ...series.map(valOf)
-  ) * 1.15;
+  const rawMax = Math.max(0, ...series.map(valOf));
+  const maxVal = computeNiceMax(rawMax, state.periodMetric === 'cost');
 
   const slotW = plotW / series.length;
-  const barW = Math.max(4, Math.min(34, slotW * 0.65));
+  const barW = Math.max(5, Math.min(32, slotW * 0.58));
 
   const yTicks = [0, 0.5, 1].map((t) => {
     const val = maxVal * t;
     const y = padT + plotH - t * plotH;
     return `
-      <line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-dasharray="3,3" />
-      <text x="${padL - 6}" y="${(y + 4).toFixed(1)}" text-anchor="end" font-size="10.5" fill="var(--text-muted)">${escapeHtml(fmtTick(val))}</text>
+      <line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-width="1" />
+      <text x="${padL - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--text-muted)">${escapeHtml(fmtTick(val))}</text>
     `;
   }).join('');
 
-  const labelStep = Math.max(1, Math.ceil(series.length / 8));
+  // Pick compact label text on narrow side panes so X-axis ticks never collide
+  const useCompactHourLabel = isSingleDayHourly && W < 720;
+  const formatXLabel = (d) => {
+    if (useCompactHourLabel && d.hour) return d.hour.slice(11); // "00:00"
+    if (W < 460 && d.hour) return d.hour.slice(5, 13); // "11-27 11"
+    return d.label;
+  };
+  const minLabelPx = useCompactHourLabel ? 52 : (W < 520 ? 58 : 82);
+  const maxLabels = Math.max(3, Math.floor(plotW / minLabelPx));
+  const labelStep = Math.max(1, Math.ceil(series.length / maxLabels));
+
+  const labelIndices = [];
+  for (let i = 0; i < series.length; i += labelStep) {
+    labelIndices.push(i);
+  }
+  const lastIdx = series.length - 1;
+  if (lastIdx > 0) {
+    const prevIdx = labelIndices[labelIndices.length - 1];
+    if ((lastIdx - prevIdx) * slotW >= minLabelPx * 0.72) {
+      labelIndices.push(lastIdx);
+    } else if (labelIndices.length > 1) {
+      labelIndices[labelIndices.length - 1] = lastIdx;
+    }
+  }
+  const labelSet = new Set(labelIndices);
+
   const bars = series.map((d, i) => {
     const v = valOf(d);
-    const h = Math.max(v > 0 ? 2 : 0, (v / maxVal) * plotH);
+    const totalH = v > 0 ? Math.max(3, (v / maxVal) * plotH) : 0;
     const x = padL + i * slotW + (slotW - barW) / 2;
-    const y = padT + plotH - h;
-    const fill = state.periodMetric === 'cost' ? 'var(--accent-warn)' : 'var(--accent-primary)';
-    const showLabel = i % labelStep === 0 || i === series.length - 1;
     const cx = padL + i * slotW + slotW / 2;
+    const baseY = padT + plotH;
+    const showLabel = labelSet.has(i);
+    const anchor = i === 0 && cx - padL < 22 ? 'start' : (i === lastIdx && W - padR - cx < 22 ? 'end' : 'middle');
+    const tx = anchor === 'start' ? padL : (anchor === 'end' ? W - padR : cx);
+
+    let barSvg = '';
+    if (totalH > 0 && state.periodMetric === 'tokens') {
+      const tot = Math.max(1, d.totalTokens || 0);
+      const cacheH = (d.cacheReadTokens / tot) * totalH;
+      const inH = (d.inputTokens / tot) * totalH;
+      const outH = Math.max(0, totalH - cacheH - inH);
+      const clipId = `bar-clip-${i}`;
+      barSvg = `
+        <defs>
+          <clipPath id="${clipId}">
+            <rect x="${x.toFixed(1)}" y="${(baseY - totalH).toFixed(1)}" width="${barW.toFixed(1)}" height="${totalH.toFixed(1)}" rx="3.5" />
+          </clipPath>
+        </defs>
+        <g clip-path="url(#${clipId})">
+          <rect x="${x.toFixed(1)}" y="${(baseY - cacheH).toFixed(1)}" width="${barW.toFixed(1)}" height="${cacheH.toFixed(1)}" fill="#0891b2" />
+          <rect x="${x.toFixed(1)}" y="${(baseY - cacheH - inH).toFixed(1)}" width="${barW.toFixed(1)}" height="${inH.toFixed(1)}" fill="#2563eb" />
+          <rect x="${x.toFixed(1)}" y="${(baseY - totalH).toFixed(1)}" width="${barW.toFixed(1)}" height="${outH.toFixed(1)}" fill="#8b5cf6" />
+        </g>
+      `;
+    } else if (totalH > 0) {
+      const fill = state.periodMetric === 'cost' ? '#d97706' : '#0891b2';
+      barSvg = `<rect x="${x.toFixed(1)}" y="${(baseY - totalH).toFixed(1)}" width="${barW.toFixed(1)}" height="${totalH.toFixed(1)}" rx="3.5" fill="${fill}" />`;
+    }
+
     return `
-      <rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="${fill}" opacity="${v > 0 ? '0.9' : '0.18'}">
-        <title>${d.date} | 调用: ${d.calls} 次 | 新增输入: ${fmtNum(d.inputTokens)} | 缓存: ${fmtNum(d.cacheReadTokens)} | 输出: ${fmtNum(d.outputTokens)} | 参考费用: ${fmtCost(d.costUsd)} (省 ${fmtCost(d.cacheSavedUsd)})</title>
-      </rect>
-      ${showLabel ? `<text x="${cx.toFixed(1)}" y="${H - 6}" text-anchor="middle" font-size="10.5" fill="var(--text-muted)">${d.date.slice(5)}</text>` : ''}
+      <g class="bar-slot" data-idx="${i}">
+        ${barSvg}
+        <rect x="${(padL + i * slotW).toFixed(1)}" y="${padT}" width="${slotW.toFixed(1)}" height="${plotH}" fill="transparent" style="cursor:pointer" />
+      </g>
+      ${showLabel ? `<text x="${tx.toFixed(1)}" y="${H - 8}" text-anchor="${anchor}" font-size="11" fill="var(--text-muted)">${escapeHtml(formatXLabel(d))}</text>` : ''}
     `;
   }).join('');
 
   return `
-    <svg class="bar-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-      ${yTicks}
-      ${bars}
-    </svg>
+    <div class="bar-chart-stage" id="barChartStage">
+      <svg class="bar-chart" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+        ${yTicks}
+        ${bars}
+      </svg>
+      <div class="chart-tooltip" id="barTooltip"></div>
+    </div>
   `;
 }
 
@@ -439,87 +602,168 @@ function renderPeriodSection() {
   sec.classList.add('open');
 
   const p = computePeriodStats();
+  const legendHtml = state.periodMetric === 'tokens'
+    ? `
+      <span class="trend-legend">
+        <span class="legend-item"><span class="swatch" style="background:#0891b2"></span>缓存读取</span>
+        <span class="legend-item"><span class="swatch" style="background:#2563eb"></span>新增输入</span>
+        <span class="legend-item"><span class="swatch" style="background:#8b5cf6"></span>输出</span>
+      </span>
+    `
+    : state.periodMetric === 'calls'
+      ? '<span class="trend-legend"><span class="legend-item"><span class="swatch" style="background:#0891b2"></span>请求次数</span></span>'
+      : '<span class="trend-legend"><span class="legend-item"><span class="swatch" style="background:#d97706"></span>参考成本</span></span>';
+
+  const granToggleHtml = p.canHourly
+    ? `
+      <div class="segmented" title="切换时间粒度">
+        <button class="gran-btn ${p.granularity === 'hour' ? 'active' : ''}" data-gran="hour">按时</button>
+        <button class="gran-btn ${p.granularity === 'day' ? 'active' : ''}" data-gran="day">按天</button>
+      </div>
+    `
+    : '';
+
   const modelChips = p.models.map((m) => `
     <span class="chip">
       <strong>${escapeHtml(m.label)}</strong>
       <span>${m.calls}次</span>
-      <span>${fmtCompact(m.inputTokens + m.outputTokens)}</span>
+      <span>总 ${fmtCnTokens(m.totalTokens)}</span>
       <span class="cost-inline">${fmtCost(m.costUsd)}</span>
     </span>
   `).join('');
 
-  const tableRows = [...p.matched].reverse().map((d) => `
+  const tableSource = p.granularity === 'hour'
+    ? p.series.filter((x) => x.calls > 0)
+    : p.matched;
+
+  const tableRows = [...tableSource].reverse().map((d) => `
     <tr>
-      <td><strong>${escapeHtml(d.date)}</strong></td>
-      <td class="num">${d.conversationCount}</td>
+      <td><strong>${escapeHtml(d.key)}</strong></td>
       <td class="num">${d.calls}</td>
+      <td class="num"><strong>${fmtNum(d.totalTokens)}</strong></td>
       <td class="num">${fmtNum(d.inputTokens)}</td>
       <td class="num">${fmtNum(d.cacheReadTokens)}</td>
       <td class="num">${fmtNum(d.outputTokens)}</td>
       <td class="num"><span class="cost-inline">${fmtCost(d.costUsd)}</span></td>
-      <td class="num"><span class="live-tag">${fmtCost(d.cacheSavedUsd)}</span></td>
     </tr>
   `).join('');
 
   sec.innerHTML = `
     <div class="panel">
       <div class="panel-header">
-        <div>
-          <h2>${escapeHtml(p.label)}每日消耗趋势（有记录 ${p.daysWithData} 天）</h2>
-          <div class="subtitle">悬停柱子可查看当天 Token 与费用详情</div>
+        <div class="trend-head-left">
+          <h2>使用趋势 · ${escapeHtml(p.label)}</h2>
+          ${legendHtml}
         </div>
         <div class="controls">
-          <button class="metric-btn ${state.periodMetric === 'cost' ? 'active' : ''}" data-metric="cost">按费用</button>
-          <button class="metric-btn ${state.periodMetric === 'tokens' ? 'active' : ''}" data-metric="tokens">按非缓存 Token</button>
-          <button class="metric-btn ${state.periodMetric === 'calls' ? 'active' : ''}" data-metric="calls">按调用次数</button>
-          <button id="copyPeriodMdBtn" title="复制 Markdown 周期统计报表">复制报表</button>
+          ${granToggleHtml}
+          <div class="segmented">
+            <button class="metric-btn ${state.periodMetric === 'tokens' ? 'active' : ''}" data-metric="tokens">Tokens</button>
+            <button class="metric-btn ${state.periodMetric === 'calls' ? 'active' : ''}" data-metric="calls">请求</button>
+            <button class="metric-btn ${state.periodMetric === 'cost' ? 'active' : ''}" data-metric="cost">成本</button>
+          </div>
+          <button id="togglePeriodTableBtn" class="${state.periodTableOpen ? 'active' : ''}">明细表</button>
+          <button id="copyPeriodMdBtn" title="复制 Markdown 统计报表">复制报表</button>
           <button id="exportPeriodCsvBtn" title="导出 Excel 兼容 CSV 明细">导出 CSV</button>
         </div>
       </div>
-      <div class="chart-wrap">${renderPeriodBarChart(p.series)}</div>
+      <div class="chart-wrap">${renderPeriodBarChart(p.series, p.granularity === 'hour' && p.start === p.end)}</div>
       ${modelChips ? `<div class="chips chips-tight">${modelChips}</div>` : ''}
-      <div class="period-table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>日期</th>
-              <th class="num">会话数</th>
-              <th class="num">调用次数</th>
-              <th class="num">新增输入</th>
-              <th class="num">缓存读取</th>
-              <th class="num">输出</th>
-              <th class="num">参考费用</th>
-              <th class="num">缓存约省</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${tableRows || '<tr><td colspan="8" class="empty">该时间段内暂无记录</td></tr>'}
-          </tbody>
-        </table>
-      </div>
+      ${state.periodTableOpen ? `
+        <div class="period-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>${p.granularity === 'hour' ? '时段' : '日期'}</th>
+                <th class="num">请求</th>
+                <th class="num">总 Token</th>
+                <th class="num">新增输入</th>
+                <th class="num">缓存读取</th>
+                <th class="num">输出</th>
+                <th class="num">参考成本</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${tableRows || '<tr><td colspan="7" class="empty">该时间段内暂无记录</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      ` : ''}
     </div>
   `;
 
+  // Bind instant floating tooltip on bar hover
+  const stage = $('barChartStage');
+  const tip = $('barTooltip');
+  if (stage && tip) {
+    stage.querySelectorAll('.bar-slot').forEach((slot) => {
+      const idx = Number(slot.getAttribute('data-idx'));
+      const item = p.series[idx];
+      if (!item) return;
+      slot.addEventListener('mouseenter', () => {
+        tip.innerHTML = `
+          <div class="tt-title">${escapeHtml(item.key)}</div>
+          <div class="tt-row"><span>总 Token</span><strong>${fmtNum(item.totalTokens)} (${fmtCnTokens(item.totalTokens)})</strong></div>
+          <div class="tt-row"><span style="color:#0891b2">● 缓存读取</span><span>${fmtNum(item.cacheReadTokens)}</span></div>
+          <div class="tt-row"><span style="color:#2563eb">● 新增输入</span><span>${fmtNum(item.inputTokens)}</span></div>
+          <div class="tt-row"><span style="color:#8b5cf6">● 输出</span><span>${fmtNum(item.outputTokens)}</span></div>
+          <div class="tt-row"><span>请求次数</span><span>${fmtNum(item.calls)} 次</span></div>
+          <div class="tt-row"><span>参考成本</span><strong class="cost-inline">${fmtCost(item.costUsd)}</strong></div>
+        `;
+        tip.style.display = 'block';
+      });
+      slot.addEventListener('mousemove', (e) => {
+        const rect = stage.getBoundingClientRect();
+        const tipW = tip.offsetWidth || 205;
+        let left = e.clientX - rect.left + 12;
+        if (left + tipW > rect.width - 8) left = Math.max(6, e.clientX - rect.left - tipW - 12);
+        const top = Math.max(4, Math.min(rect.height - (tip.offsetHeight || 140) - 4, e.clientY - rect.top - 24));
+        tip.style.left = `${left}px`;
+        tip.style.top = `${top}px`;
+      });
+      slot.addEventListener('mouseleave', () => {
+        tip.style.display = 'none';
+      });
+    });
+  }
+
   sec.querySelectorAll('.metric-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
-      state.periodMetric = btn.getAttribute('data-metric') || 'cost';
+      state.periodMetric = btn.getAttribute('data-metric') || 'tokens';
       renderPeriodSection();
     });
   });
 
+  sec.querySelectorAll('.gran-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.granularity = btn.getAttribute('data-gran') || 'auto';
+      renderPeriodSection();
+    });
+  });
+
+  const tableToggle = $('togglePeriodTableBtn');
+  if (tableToggle) {
+    tableToggle.addEventListener('click', () => {
+      state.periodTableOpen = !state.periodTableOpen;
+      renderPeriodSection();
+    });
+  }
+
   const copyBtn = $('copyPeriodMdBtn');
   if (copyBtn) {
     copyBtn.addEventListener('click', async () => {
+      const colName = p.granularity === 'hour' ? '时段' : '日期';
       const mdLines = [
-        `### Antigravity 上下文与费用统计（${p.label}）`,
-        `- 调用次数：${fmtNum(p.calls)} 次（活跃会话 ${p.conversationCount} 个）`,
+        `### Antigravity 使用统计（${p.label}）`,
+        `- 总 Token（输入+缓存+输出）：${fmtNum(p.totalTokens)}（${fmtCnTokens(p.totalTokens)}）`,
         `- 新增输入 / 缓存读取 / 输出：${fmtNum(p.inputTokens)} / ${fmtNum(p.cacheReadTokens)} / ${fmtNum(p.outputTokens)}`,
-        `- 参考费用：${fmtCost(p.costUsd)}（缓存约省 ${fmtCost(p.cacheSavedUsd)}，命中率 ${fmtPct(p.cacheHitRate)}）`,
+        `- 请求次数：${fmtNum(p.calls)} 次（活跃会话 ${p.conversationCount} 个）`,
+        `- 参考成本：${fmtCost(p.costUsd)}（缓存命中率 ${fmtPct(p.cacheHitRate)}）`,
         '',
-        '| 日期 | 会话数 | 调用 | 新增输入 | 缓存读取 | 输出 | 参考费用 | 缓存约省 |',
-        '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
-        ...[...p.matched].reverse().map((d) =>
-          `| ${d.date} | ${d.conversationCount} | ${d.calls} | ${fmtNum(d.inputTokens)} | ${fmtNum(d.cacheReadTokens)} | ${fmtNum(d.outputTokens)} | ${fmtCost(d.costUsd)} | ${fmtCost(d.cacheSavedUsd)} |`
+        `| ${colName} | 请求 | 总 Token | 新增输入 | 缓存读取 | 输出 | 参考成本 |`,
+        '| --- | ---: | ---: | ---: | ---: | ---: | ---: |',
+        ...[...tableSource].reverse().map((d) =>
+          `| ${d.key} | ${d.calls} | ${fmtNum(d.totalTokens)} | ${fmtNum(d.inputTokens)} | ${fmtNum(d.cacheReadTokens)} | ${fmtNum(d.outputTokens)} | ${fmtCost(d.costUsd)} |`
         ),
       ].join('\n');
       try {
@@ -554,16 +798,15 @@ function renderPeriodSection() {
       const unit = isCny ? 'CNY' : 'USD';
       const conv = (usd) => (isCny ? (usd * rate).toFixed(4) : usd.toFixed(4));
       const rows = [
-        ['日期', '会话数', '调用次数', '新增输入Token', '缓存读取Token', '输出Token', `参考费用(${unit})`, `缓存约省(${unit})`],
-        ...[...p.matched].reverse().map((d) => [
-          d.date,
-          d.conversationCount,
+        [p.granularity === 'hour' ? '时段' : '日期', '请求次数', '总Token', '新增输入Token', '缓存读取Token', '输出Token', `参考成本(${unit})`],
+        ...[...tableSource].reverse().map((d) => [
+          d.key,
           d.calls,
+          d.totalTokens,
           d.inputTokens,
           d.cacheReadTokens,
           d.outputTokens,
           conv(d.costUsd || 0),
-          conv(d.cacheSavedUsd || 0),
         ]),
       ];
       const csv = '\uFEFF' + rows.map((r) => r.join(',')).join('\r\n');
@@ -634,6 +877,7 @@ function renderConversationControls() {
       const id = el.getAttribute('data-id');
       if (id && id !== state.selectedId) {
         state.selectedId = id;
+        state.stepPage = 1;
         renderConversationControls();
         fetchDetail(id);
       }
@@ -641,20 +885,34 @@ function renderConversationControls() {
   });
 }
 
-function renderChart(steps, limit) {
+function isCtxChartOpen() {
+  if (state.ctxChartOpen !== null) return state.ctxChartOpen;
+  return (window.innerWidth || 0) >= 820;
+}
+
+function getWindowedSteps(steps) {
+  if (!steps || steps.length === 0) return [];
+  if (state.ctxWindow === '30') return steps.slice(-30);
+  if (state.ctxWindow === '100') return steps.slice(-100);
+  return steps;
+}
+
+function renderChart(rawSteps, limit) {
+  const steps = getWindowedSteps(rawSteps);
   if (!steps || steps.length === 0) {
     return '<div class="empty">该会话还没有模型调用记录</div>';
   }
-  const W = 720;
+  const W = getChartWidth(720);
   const H = 190;
-  const padL = 52;
+  const padL = W < 480 ? 48 : 56;
   const padR = 16;
   const padT = 16;
   const padB = 26;
-  const plotW = W - padL - padR;
+  const plotW = Math.max(120, W - padL - padR);
   const plotH = H - padT - padB;
 
-  const maxVal = Math.max(10000, ...steps.map((s) => s.contextTokens)) * 1.12;
+  const rawMax = Math.max(10000, ...steps.map((s) => s.contextTokens));
+  const maxVal = computeNiceMax(rawMax, false);
   const xFor = (i) => (steps.length === 1 ? padL + plotW / 2 : padL + (i / (steps.length - 1)) * plotW);
   const yFor = (v) => padT + plotH - (v / maxVal) * plotH;
 
@@ -665,45 +923,140 @@ function renderChart(steps, limit) {
     steps.map((s, i) => `L ${xFor(i).toFixed(1)},${yFor(s.contextTokens).toFixed(1)}`).join(' ') +
     ` L ${xFor(steps.length - 1).toFixed(1)},${(padT + plotH).toFixed(1)} Z`;
 
-  const yTicks = [0, 0.25, 0.5, 0.75, 1].map((t) => {
+  const yTicks = [0, 0.5, 1].map((t) => {
     const val = maxVal * t;
     const y = yFor(val);
     return `
-      <line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-dasharray="3,3" />
-      <text x="${padL - 6}" y="${(y + 4).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--text-muted)">${fmtCompact(Math.round(val))}</text>
+      <line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-width="1" />
+      <text x="${padL - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--text-muted)">${val === 0 ? '0' : fmtCnTokens(val)}</text>
     `;
   }).join('');
 
-  const dots = steps.map((s, i) => {
-    const cx = xFor(i).toFixed(1);
-    const cy = yFor(s.contextTokens).toFixed(1);
-    const fill = s.isCompactionDrop ? 'var(--accent-warn)' : 'var(--accent-primary)';
-    return `<circle cx="${cx}" cy="${cy}" r="${steps.length > 35 ? 2.5 : 3.5}" fill="${fill}">
-      <title>Step ${s.stepIndex} | 上下文: ${fmtNum(s.contextTokens)} | 缓存: ${fmtNum(s.cacheReadTokens)} | 新增输入: ${fmtNum(s.inputTokens)} | 输出: ${fmtNum(s.outputTokens)} | 费用: ${fmtCost(s.costUsd)}</title>
-    </circle>`;
-  }).join('');
+  // Highlight only compaction drop markers subtly, never cluttering normal steps with dense dots
+  const compactionMarkers = steps
+    .map((s, i) => {
+      if (!s.isCompactionDrop) return '';
+      const x = xFor(i).toFixed(1);
+      const y = yFor(s.contextTokens).toFixed(1);
+      return `
+        <line x1="${x}" y1="${padT}" x2="${x}" y2="${(padT + plotH).toFixed(1)}" stroke="var(--accent-warn)" stroke-width="1" stroke-dasharray="3,3" opacity="0.65" />
+        <circle cx="${x}" cy="${y}" r="3.5" fill="var(--accent-warn)" />
+      `;
+    })
+    .join('');
 
-  const xLabels = [0, Math.floor((steps.length - 1) / 2), steps.length - 1]
-    .filter((v, idx, arr) => arr.indexOf(v) === idx)
-    .map((i) => `<text x="${xFor(i).toFixed(1)}" y="${H - 6}" text-anchor="middle" font-size="11" fill="var(--text-muted)">Step ${steps[i].stepIndex}</text>`)
+  const maxXLabels = Math.max(3, Math.floor(plotW / 76));
+  const xStep = Math.max(1, Math.ceil((steps.length - 1) / Math.max(1, maxXLabels - 1)));
+  const xIndices = [];
+  for (let i = 0; i < steps.length; i += xStep) xIndices.push(i);
+  const lastI = steps.length - 1;
+  if (lastI > 0 && xIndices[xIndices.length - 1] !== lastI) {
+    if ((lastI - xIndices[xIndices.length - 1]) * (plotW / Math.max(1, lastI)) >= 52) {
+      xIndices.push(lastI);
+    } else if (xIndices.length > 1) {
+      xIndices[xIndices.length - 1] = lastI;
+    }
+  }
+
+  const xLabels = xIndices
+    .map((i) => {
+      const x = xFor(i);
+      const anchor = i === 0 ? 'start' : (i === lastI ? 'end' : 'middle');
+      const tx = i === 0 ? padL : (i === lastI ? W - padR : x);
+      return `<text x="${tx.toFixed(1)}" y="${H - 6}" text-anchor="${anchor}" font-size="11" fill="var(--text-muted)">#${steps[i].stepIndex}</text>`;
+    })
     .join('');
 
   return `
     <div class="chart-legend">
       <span class="legend-item"><span class="swatch" style="background:var(--accent-primary)"></span>总上下文</span>
-      <span class="legend-item"><span class="swatch" style="background:var(--accent-ok)"></span>缓存命中</span>
+      <span class="legend-item"><span class="swatch" style="background:#0891b2"></span>缓存读取</span>
       <span class="legend-item"><span class="swatch" style="background:var(--accent-warn)"></span>压缩回落</span>
-      <span class="legend-right">上限 ${fmtCompact(limit)}</span>
+      <span class="legend-right">显示 ${steps.length} / ${rawSteps.length} 步 · 上限 ${fmtCompact(limit)}</span>
     </div>
-    <svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-      ${yTicks}
-      <path d="${areaPath}" fill="var(--accent-primary-soft)" />
-      <polyline fill="none" stroke="var(--accent-ok)" stroke-width="1.8" stroke-dasharray="4,3" points="${cachePoints}" />
-      <polyline fill="none" stroke="var(--accent-primary)" stroke-width="2.4" points="${ctxPoints}" />
-      ${dots}
-      ${xLabels}
-    </svg>
+    <div class="bar-chart-stage" id="ctxChartStage"
+      data-padl="${padL}" data-padr="${padR}" data-padt="${padT}" data-ploth="${plotH}"
+      data-w="${W}" data-maxval="${maxVal}">
+      <svg class="chart" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+        ${yTicks}
+        <path d="${areaPath}" fill="var(--accent-primary-soft)" />
+        <polyline fill="none" stroke="#0891b2" stroke-width="1.6" stroke-dasharray="4,3" points="${cachePoints}" />
+        <polyline fill="none" stroke="var(--accent-primary)" stroke-width="2.2" stroke-linejoin="round" points="${ctxPoints}" />
+        ${compactionMarkers}
+        <line id="ctxCrosshair" x1="0" y1="${padT}" x2="0" y2="${(padT + plotH).toFixed(1)}" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="3,3" style="display:none" />
+        <circle id="ctxActiveDot" cx="0" cy="0" r="4.5" fill="var(--accent-primary)" stroke="var(--surface)" stroke-width="2" style="display:none" />
+        <rect id="ctxHitArea" x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" fill="transparent" style="cursor:crosshair" />
+        ${xLabels}
+      </svg>
+      <div class="chart-tooltip" id="ctxTooltip"></div>
+    </div>
   `;
+}
+
+function bindCtxChartInteractions(rawSteps) {
+  const stage = $('ctxChartStage');
+  const hit = $('ctxHitArea');
+  const crosshair = $('ctxCrosshair');
+  const dot = $('ctxActiveDot');
+  const tip = $('ctxTooltip');
+  const steps = getWindowedSteps(rawSteps);
+  if (!stage || !hit || !crosshair || !dot || !tip || steps.length === 0) return;
+
+  const padL = Number(stage.getAttribute('data-padl'));
+  const padR = Number(stage.getAttribute('data-padr'));
+  const padT = Number(stage.getAttribute('data-padt'));
+  const plotH = Number(stage.getAttribute('data-ploth'));
+  const W = Number(stage.getAttribute('data-w'));
+  const maxVal = Number(stage.getAttribute('data-maxval')) || 1;
+  const plotW = Math.max(1, W - padL - padR);
+
+  const showAt = (clientX, clientY) => {
+    const rect = stage.getBoundingClientRect();
+    const scaleX = W / Math.max(1, rect.width);
+    const svgX = (clientX - rect.left) * scaleX;
+    const ratio = Math.max(0, Math.min(1, (svgX - padL) / plotW));
+    const idx = steps.length === 1 ? 0 : Math.round(ratio * (steps.length - 1));
+    const s = steps[idx];
+    if (!s) return;
+
+    const cx = steps.length === 1 ? padL + plotW / 2 : padL + (idx / (steps.length - 1)) * plotW;
+    const cy = padT + plotH - (s.contextTokens / maxVal) * plotH;
+
+    crosshair.setAttribute('x1', cx.toFixed(1));
+    crosshair.setAttribute('x2', cx.toFixed(1));
+    crosshair.style.display = 'block';
+    dot.setAttribute('cx', cx.toFixed(1));
+    dot.setAttribute('cy', cy.toFixed(1));
+    dot.style.display = 'block';
+
+    const toolLabel = (s.tools && s.tools.length > 0) ? s.tools.slice(0, 3).join(', ') + (s.tools.length > 3 ? '…' : '') : '文本回复';
+    tip.innerHTML = `
+      <div class="tt-title">Step #${s.stepIndex} · ${fmtTime(s.createdAt)}${s.isCompactionDrop ? ' <span class="tag-compact">压缩</span>' : ''}</div>
+      <div class="tt-row"><span>模型</span><span>${escapeHtml(s.modelLabel)}</span></div>
+      <div class="tt-row"><span>总上下文</span><strong>${fmtNum(s.contextTokens)} (${fmtCnTokens(s.contextTokens)})</strong></div>
+      <div class="tt-row"><span style="color:#0891b2">● 缓存读取</span><span>${fmtNum(s.cacheReadTokens)} (${fmtPct(s.cacheHitRate)})</span></div>
+      <div class="tt-row"><span style="color:#2563eb">● 新增输入</span><span>${fmtNum(s.inputTokens)}</span></div>
+      <div class="tt-row"><span style="color:#8b5cf6">● 输出</span><span>${fmtNum(s.outputTokens)}</span></div>
+      <div class="tt-row"><span>参考成本</span><strong class="cost-inline">${fmtCost(s.costUsd)}</strong></div>
+      <div class="tt-row"><span>动作</span><span>${escapeHtml(toolLabel)}</span></div>
+    `;
+    tip.style.display = 'block';
+
+    const tipW = tip.offsetWidth || 210;
+    let left = clientX - rect.left + 12;
+    if (left + tipW > rect.width - 6) left = Math.max(6, clientX - rect.left - tipW - 12);
+    const top = Math.max(4, Math.min(rect.height - (tip.offsetHeight || 150) - 4, clientY - rect.top - 24));
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+  };
+
+  hit.addEventListener('mousemove', (e) => showAt(e.clientX, e.clientY));
+  hit.addEventListener('mouseenter', (e) => showAt(e.clientX, e.clientY));
+  hit.addEventListener('mouseleave', () => {
+    crosshair.style.display = 'none';
+    dot.style.display = 'none';
+    tip.style.display = 'none';
+  });
 }
 
 function renderDetail() {
@@ -735,7 +1088,20 @@ function renderDetail() {
     <span class="chip"><code>${escapeHtml(t.name)}</code> <strong>×${t.count}</strong></span>
   `).join('');
 
-  const rowsHtml = [...(d.steps || [])].reverse().map((s) => `
+  const allStepsRev = [...(d.steps || [])].reverse();
+  const totalSteps = allStepsRev.length;
+  const pageSize = state.stepPageSize > 0 ? state.stepPageSize : Math.max(1, totalSteps);
+  const totalPages = Math.max(1, Math.ceil(totalSteps / pageSize));
+  if (state.stepPage > totalPages) state.stepPage = totalPages;
+  if (state.stepPage < 1) state.stepPage = 1;
+  const startIdx = (state.stepPage - 1) * pageSize;
+  const pageSteps = state.stepPageSize > 0
+    ? allStepsRev.slice(startIdx, startIdx + pageSize)
+    : allStepsRev;
+  const rangeStart = totalSteps === 0 ? 0 : startIdx + 1;
+  const rangeEnd = totalSteps === 0 ? 0 : Math.min(totalSteps, startIdx + pageSteps.length);
+
+  const rowsHtml = pageSteps.map((s) => `
     <tr>
       <td>#${s.stepIndex}${s.isCompactionDrop ? '<span class="tag-compact">压缩</span>' : ''}</td>
       <td>${fmtTime(s.createdAt)}</td>
@@ -780,14 +1146,14 @@ function renderDetail() {
 
         <div class="kpi-grid">
           <div class="kpi-card">
-            <div class="k-label">本会话参考费用</div>
+            <div class="k-label">本会话参考成本</div>
             <div class="k-val cost-val">${fmtCost(cost.totalUsd)}</div>
             <div class="k-sub">入 ${fmtCost(cost.inputUsd)} · 缓 ${fmtCost(cost.cacheUsd)} · 出 ${fmtCost(cost.outputUsd)}</div>
           </div>
           <div class="kpi-card">
-            <div class="k-label">缓存约省费用</div>
-            <div class="k-val live-tag">${fmtCost(cost.cacheSavedUsd)}</div>
-            <div class="k-sub">平均命中率 ${fmtPct(d.avgCacheHitRate)}</div>
+            <div class="k-label">会话缓存命中率</div>
+            <div class="k-val live-tag">${fmtPct(d.avgCacheHitRate)}</div>
+            <div class="k-sub">缓存读取 ${fmtCnTokens(d.totals.cacheReadTokens)}</div>
           </div>
           <div class="kpi-card">
             <div class="k-label">当前上下文</div>
@@ -813,13 +1179,25 @@ function renderDetail() {
       </div>
     </div>
 
-    <div class="panel">
-      <div class="panel-header">
-        <h2>上下文增长趋势</h2>
-        <span class="muted small">悬停圆点查看单步 Token 与费用</span>
-      </div>
-      <div class="chart-wrap">${renderChart(d.steps, limit)}</div>
-    </div>
+        <div class="panel">
+          <div class="panel-header">
+            <div class="trend-head-left">
+              <h2>上下文增长趋势</h2>
+              <span class="muted small">共 ${(d.steps || []).length} 步 · 峰值 ${fmtCnTokens(d.peakContext)}${d.compactionCount > 0 ? ` · 压缩 ${d.compactionCount} 次` : ''}</span>
+            </div>
+            <div class="controls">
+              ${isCtxChartOpen() ? `
+                <div class="segmented">
+                  <button class="ctx-win-btn ${state.ctxWindow === '30' ? 'active' : ''}" data-win="30">近 30 步</button>
+                  <button class="ctx-win-btn ${state.ctxWindow === '100' ? 'active' : ''}" data-win="100">近 100 步</button>
+                  <button class="ctx-win-btn ${state.ctxWindow === 'all' ? 'active' : ''}" data-win="all">全部</button>
+                </div>
+              ` : ''}
+              <button id="toggleCtxChartBtn" class="${isCtxChartOpen() ? 'active' : ''}">${isCtxChartOpen() ? '收起' : '展开'}</button>
+            </div>
+          </div>
+          ${isCtxChartOpen() ? `<div class="chart-wrap">${renderChart(d.steps, limit)}</div>` : ''}
+        </div>
 
     <div class="panel">
       <div class="panel-header"><h2>模型费用分布与高频工具</h2></div>
@@ -852,8 +1230,62 @@ function renderDetail() {
           </tbody>
         </table>
       </div>
+      ${totalSteps > 0 ? `
+        <div class="pagination-bar">
+          <div class="pagination-controls">
+            <span>第 ${rangeStart}–${rangeEnd} 条 / 共 ${totalSteps} 条</span>
+            <select id="stepPageSizeSelect" title="每页显示条数">
+              <option value="10" ${state.stepPageSize === 10 ? 'selected' : ''}>10 条/页</option>
+              <option value="20" ${state.stepPageSize === 20 ? 'selected' : ''}>20 条/页</option>
+              <option value="50" ${state.stepPageSize === 50 ? 'selected' : ''}>50 条/页</option>
+              <option value="0" ${state.stepPageSize === 0 ? 'selected' : ''}>全部</option>
+            </select>
+          </div>
+          <div class="pagination-controls">
+            <button id="stepFirstBtn" ${state.stepPage <= 1 ? 'disabled' : ''}>首页</button>
+            <button id="stepPrevBtn" ${state.stepPage <= 1 ? 'disabled' : ''}>上一页</button>
+            <span>${state.stepPage} / ${totalPages}</span>
+            <button id="stepNextBtn" ${state.stepPage >= totalPages ? 'disabled' : ''}>下一页</button>
+            <button id="stepLastBtn" ${state.stepPage >= totalPages ? 'disabled' : ''}>末页</button>
+          </div>
+        </div>
+      ` : ''}
     </div>
   `;
+
+  const toggleCtxBtn = $('toggleCtxChartBtn');
+  if (toggleCtxBtn) {
+    toggleCtxBtn.addEventListener('click', () => {
+      state.ctxChartOpen = !isCtxChartOpen();
+      renderDetail();
+    });
+  }
+  document.querySelectorAll('.ctx-win-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.ctxWindow = btn.getAttribute('data-win') || '30';
+      renderDetail();
+    });
+  });
+  if (isCtxChartOpen()) {
+    bindCtxChartInteractions(d.steps || []);
+  }
+
+  const pageSizeSel = $('stepPageSizeSelect');
+  if (pageSizeSel) {
+    pageSizeSel.addEventListener('change', (e) => {
+      state.stepPageSize = Number(e.target.value) || 0;
+      state.stepPage = 1;
+      renderDetail();
+    });
+  }
+  const firstBtn = $('stepFirstBtn');
+  const prevBtn = $('stepPrevBtn');
+  const nextBtn = $('stepNextBtn');
+  const lastBtn = $('stepLastBtn');
+  if (firstBtn) firstBtn.addEventListener('click', () => { state.stepPage = 1; renderDetail(); });
+  if (prevBtn) prevBtn.addEventListener('click', () => { state.stepPage = Math.max(1, state.stepPage - 1); renderDetail(); });
+  if (nextBtn) nextBtn.addEventListener('click', () => { state.stepPage = Math.min(totalPages, state.stepPage + 1); renderDetail(); });
+  if (lastBtn) lastBtn.addEventListener('click', () => { state.stepPage = totalPages; renderDetail(); });
 }
 
 function updateFooter() {
@@ -969,6 +1401,7 @@ function bindControls() {
     const id = e.target.value;
     if (id && id !== state.selectedId) {
       state.selectedId = id;
+      state.stepPage = 1;
       renderConversationControls();
       fetchDetail(id);
     }
@@ -1006,7 +1439,8 @@ function bindControls() {
     btn.addEventListener('click', () => {
       const next = btn.getAttribute('data-range') || 'today';
       state.rangeMode = next;
-      if (next !== 'today') state.periodOpen = true;
+      state.granularity = 'auto';
+      state.periodOpen = true;
       renderRangeBar();
       renderSummary();
       renderPeriodSection();
@@ -1017,6 +1451,7 @@ function bindControls() {
     state.customStart = $('startDateInput').value;
     state.customEnd = $('endDateInput').value;
     state.rangeMode = 'custom';
+    state.granularity = 'auto';
     state.periodOpen = true;
     renderRangeBar();
     renderSummary();
@@ -1029,6 +1464,15 @@ function bindControls() {
     state.periodOpen = !state.periodOpen;
     renderRangeBar();
     renderPeriodSection();
+  });
+
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (state.overview) renderPeriodSection();
+      if (state.detail) renderDetail();
+    }, 120);
   });
 }
 

@@ -159,6 +159,10 @@ test('MCP stdio server parses mock multi-day transcripts, calculates pricing, an
     assert.equal(sc.detail.currentContext, 100000);
     assert.equal(sc.detail.currentCacheHitRate, 0.95);
     assert.equal(sc.overview.dailyStats.length, 2);
+    assert.equal(sc.overview.hourlyStats.length, 2);
+    assert.equal(sc.overview.dailyStats[0].totalTokens, 11000);
+    assert.equal(sc.overview.dailyStats[1].totalTokens, 102000);
+    assert.equal(sc.overview.hourlyStats[1].totalTokens, 102000);
     // Hydrogen step: 10k*1.5/1e6 + 1k*7.5/1e6 = 0.015 + 0.0075 = 0.0225
     // Neon step: 5k*3/1e6 + 95k*0.15/1e6 + 2k*15/1e6 = 0.015 + 0.01425 + 0.03 = 0.05925
     assert.ok(Math.abs(sc.detail.cost.totalUsd - 0.08175) < 1e-6);

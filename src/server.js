@@ -40,7 +40,7 @@ function fmtMoney(usd, cfg) {
 const server = new Server(
   {
     name: 'context-monitor',
-    version: '1.2.0',
+    version: '1.3.0',
   },
   {
     capabilities: {
@@ -193,7 +193,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `当前聚焦会话「${detail.title}」(${detail.id.slice(0, 8)}): ` +
         `上下文 ${detail.currentContext.toLocaleString('en-US')} tokens (${pct}% / ${fmtCompact(detail.defaultContextLimit)})，` +
         `缓存命中率 ${(detail.currentCacheHitRate * 100).toFixed(1)}%，` +
-        `本会话参考费用 ${fmtMoney(detail.cost.totalUsd, pricingConfig)}（缓存约省 ${fmtMoney(detail.cost.cacheSavedUsd, pricingConfig)}）。`
+        `本会话参考成本 ${fmtMoney(detail.cost.totalUsd, pricingConfig)}。`
       );
     }
 
